@@ -1212,6 +1212,14 @@ if not source_ready:
 if not target_ready:
     missing.append("原始文档")
 
+# 输入变化时重置语义确认状态，避免复用旧确认结果。
+_cur_input_signature = (spec_text or "") if (not use_demo and spec_mode == "文字说明") else None
+if st.session_state.get("_input_signature") != _cur_input_signature:
+    st.session_state["_input_signature"] = _cur_input_signature
+    st.session_state.pop("semantic_confirmed", None)
+    st.session_state.pop("confirmed_spec", None)
+    st.session_state.pop("pending_semantic", None)
+
 with st.container(border=True):
     action_left, action_right = st.columns([1.9, 1], gap="large", vertical_alignment="center")
     with action_left:
@@ -1242,6 +1250,152 @@ with st.container(border=True):
             width="stretch",
             disabled=not can_run,
         )
+
+
+# ---------------- 语义确认层 ----------------
+# 当格式来源是"文字说明"时，先让模型把非正式描述归一化成可确认的结构，
+# 用户确认/修正后才进入排版。其他模式（预制 JSON / 模板 / 演示）跳过。
+_needs_semantic_confirm = (
+    run and can_run
+    and not use_demo
+    and spec_json_file is None
+    and spec_mode == "文字说明"
+    and spec_text and spec_text.strip()
+)
+
+if _needs_semantic_confirm and not st.session_state.get("semantic_confirmed"):
+    from core.semantic_extract import (
+        ALIGNMENT_LABELS, FONT_OPTIONS, ROLE_LABELS, SIZE_PT_OPTIONS,
+        extract_semantic, label_to_pt, pt_to_label,
+    )
+
+    with st.spinner("正在理解你的格式要求，准备确认清单……"):
+        try:
+            semantic = extract_semantic(spec_text=spec_text)
+        except Exception as exc:
+            st.error(f"格式要求理解失败：{exc}")
+            st.stop()
+    st.session_state["pending_semantic"] = semantic
+
+    st.markdown('<div class="section-kicker">CONFIRM</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">请确认格式理解结果</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-help">模型已把你的要求拆成三部分。'
+        '模糊的描述需要你确认建议值；确认后才会开始排版。</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.form("semantic_confirm_form"):
+        # ---- 第一部分：已确定的格式规则 ----
+        st.markdown("#### 1. 已识别的格式规则")
+        st.caption("这些是你要求里写明确的项，可直接修改。")
+        _format_rows = []
+        for role, rule in (semantic.get("format_spec") or {}).items():
+            with st.expander(ROLE_LABELS.get(role, role), expanded=False):
+                col1, col2, col3 = st.columns(3)
+                font = col1.selectbox(
+                    "中文字体",
+                    FONT_OPTIONS,
+                    index=(FONT_OPTIONS.index(rule["font_eastasia"])
+                           if rule.get("font_eastasia") in FONT_OPTIONS else 0),
+                    key=f"fmt-{role}",
+                )
+                _size_labels = [f"{n}（{p}pt）" for n, p in SIZE_PT_OPTIONS.items()]
+                _cur_size = pt_to_label(rule.get("size_pt"))
+                size = col2.selectbox(
+                    "字号",
+                    _size_labels,
+                    index=(_size_labels.index(_cur_size)
+                           if _cur_size in _size_labels else 9),
+                    key=f"size-{role}",
+                )
+                align_keys = list(ALIGNMENT_LABELS.keys())
+                align = col3.selectbox(
+                    "对齐",
+                    align_keys,
+                    format_func=lambda k: ALIGNMENT_LABELS[k],
+                    index=(align_keys.index(rule["alignment"])
+                           if rule.get("alignment") in align_keys else 3),
+                    key=f"align-{role}",
+                )
+                bold = st.checkbox("加粗", value=bool(rule.get("bold")), key=f"bold-{role}")
+                indent = st.number_input(
+                    "首行缩进（字符）",
+                    min_value=0.0, max_value=8.0, step=0.5,
+                    value=float(rule.get("first_line_indent_chars") or 0),
+                    key=f"indent-{role}",
+                )
+                _format_rows.append({
+                    "role": role, "font": font, "size": size,
+                    "align": align, "bold": bold, "indent": indent,
+                })
+
+        # ---- 第二部分：模糊项确认 ----
+        ambiguities = semantic.get("ambiguities") or []
+        if ambiguities:
+            st.markdown("#### 2. 需要你确认的模糊描述")
+            st.caption("模型无法从原文直接确定，给出了建议值。接受或修改。")
+            _ambiguity_rows = []
+            for i, amb in enumerate(ambiguities):
+                with st.expander(f"{i+1}. {amb.get('original', '')[:40]}", expanded=True):
+                    st.caption(f"问题：{amb.get('issue', '')}")
+                    decision = st.radio(
+                        "如何处理",
+                        ["采纳建议", "我指定值", "忽略此项"],
+                        horizontal=True,
+                        key=f"amb-choice-{i}",
+                    )
+                    custom = st.text_input(
+                        "自定义值（选择“我指定值”时填写）",
+                        key=f"amb-custom-{i}",
+                    )
+                    _ambiguity_rows.append({
+                        "original": amb.get("original"),
+                        "suggestion": amb.get("suggestion"),
+                        "decision": decision,
+                        "custom": custom,
+                    })
+
+        # ---- 第三部分：内容要求 ----
+        content_reqs = semantic.get("content_requirements") or []
+        if content_reqs:
+            st.markdown("#### 3. 内容要求")
+            st.caption("这些是文档里必须包含的内容。需要具体值的请填写。")
+            _content_rows = []
+            for i, req in enumerate(content_reqs):
+                st.markdown(f"**{req.get('item', f'要求{i+1}')}**：{req.get('requirement', '')}")
+                _content_rows.append({"item": req.get("item"), "requirement": req.get("requirement")})
+
+        submitted = st.form_submit_button("确认并开始排版", type="primary")
+
+    if submitted:
+        # 把确认结果合并回 FormatSpec
+        _roles = dict(semantic.get("format_spec") or {})
+        for row in _format_rows:
+            _roles.setdefault(row["role"], {})
+            _roles[row["role"]].update({
+                "font_eastasia": row["font"],
+                "size_pt": label_to_pt(row["size"]),
+                "alignment": row["align"],
+                "bold": row["bold"],
+                "first_line_indent_chars": row["indent"],
+            })
+        # 兜底：FormatSpec 要求 roles.body 必填，每个角色至少三个字段
+        _defaults = {"font_eastasia": "宋体", "size_pt": 12.0, "alignment": "justify"}
+        for _role, _rule in _roles.items():
+            for _k, _v in _defaults.items():
+                if _rule.get(_k) is None:
+                    _rule[_k] = _v
+        if "body" not in _roles:
+            _roles["body"] = {"font_eastasia": "宋体", "size_pt": 12.0,
+                              "alignment": "justify", "first_line_indent_chars": 2.0}
+        _confirmed = {"roles": _roles}
+        st.session_state["confirmed_spec"] = _confirmed
+        st.session_state["confirmed_content"] = _content_rows
+        st.session_state["semantic_confirmed"] = True
+        st.rerun()
+
+    st.stop()
 
 
 # ---------------- Agent 执行 ----------------
@@ -1345,6 +1499,10 @@ if run and can_run:
                 kwargs["spec"] = json.load(handle)
         elif spec_mode == "参考模板":
             kwargs["template_path"] = _save_upload(template_file, ".docx")
+        elif st.session_state.get("semantic_confirmed") and st.session_state.get("confirmed_spec"):
+            # 语义确认层已产出用户确认后的 FormatSpec，直接使用，跳过重复理解
+            kwargs["spec"] = st.session_state["confirmed_spec"]
+            validate_spec(kwargs["spec"])
         else:
             kwargs["spec_text"] = spec_text
 
